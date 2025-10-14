@@ -224,10 +224,6 @@ app.get('/download/:hash', (req, res) => {
   });
 });
 
-app.get('*', (req, res) => {
-  res.sendFile(path.join(process.cwd(), 'dist', 'index.html'));
-});
-
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
