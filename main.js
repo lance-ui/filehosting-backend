@@ -192,7 +192,7 @@ app.delete('/api/files/:id', verifyToken, (req, res) => {
 });
 
 // Download file
-app.get('/download/:hash', (req, res) => {
+app.get('/api/download/:hash', (req, res) => {
   const hash = req.params.hash;
   // Find file by hash across all user tables
   db.all("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'files_user_%'", [], (err, tables) => {
