@@ -14,12 +14,7 @@ const JWT_SECRET = 'YKi9axgBWzDsAQqvWuA3znrlMh2dL+4l89dbtf4vb2k=';
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(process.cwd(), 'dist')));
-app.use(express.static(path.join(process.cwd(), 'public')));
 
-// Files stored in database
-
-// Database setup
 const db = new sqlite3.Database('./lance-cdn.db');
 
 // Initialize database
