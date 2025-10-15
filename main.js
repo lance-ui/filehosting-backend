@@ -10,7 +10,7 @@ import fs from 'fs';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = 'your-secret-key';
+const JWT_SECRET = 'YKi9axgBWzDsAQqvWuA3znrlMh2dL+4l89dbtf4vb2k=';
 
 app.use(cors());
 app.use(express.json());
