@@ -10,11 +10,12 @@ import fs from 'fs';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = 'YKi9axgBWzDsAQqvWuA3znrlMh2dL+4l89dbtf4vb2k=';
+const JWT_SECRET = 'your-secret-key';
 
 app.use(cors());
 app.use(express.json());
 
+// Database setup
 const db = new sqlite3.Database('./lance-cdn.db');
 
 // Initialize database
@@ -186,8 +187,25 @@ app.delete('/api/files/:id', verifyToken, (req, res) => {
   });
 });
 
+// Edit file content
+app.put('/api/files/:id/content', verifyToken, (req, res) => {
+  const { id } = req.params;
+  const { content } = req.body;
+  const userId = req.user.id;
+
+  if (content === undefined) return res.status(400).json({ error: 'Content required' });
+
+  const contentBase64 = Buffer.from(content).toString('base64');
+
+  db.run(`UPDATE files_user_${userId} SET content = ? WHERE id = ?`, [contentBase64, id], function(err) {
+    if (err) return res.status(500).json({ error: 'Failed to update file content' });
+    if (this.changes === 0) return res.status(404).json({ error: 'File not found' });
+    res.json({ message: 'File content updated' });
+  });
+});
+
 // Download file
-app.get('/api/download/:hash', (req, res) => {
+app.get('/download/:hash', (req, res) => {
   const hash = req.params.hash;
   // Find file by hash across all user tables
   db.all("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'files_user_%'", [], (err, tables) => {
