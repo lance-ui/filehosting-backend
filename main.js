@@ -1,252 +1,191 @@
-import express from 'express';
-import sqlite3 from 'sqlite3';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-import multer from 'multer';
-import cors from 'cors';
-import crypto from 'crypto';
+import fetch from 'node-fetch'; 
+import fs from 'fs'; 
+import { promises as fsp } from 'fs';
 import path from 'path';
-import fs from 'fs';
-import rateLimit from 'express-rate-limit';
+import FormData from 'form-data'; 
 
-const app = express();
-const PORT = process.env.PORT || 5000;
-const JWT_SECRET = 'your-secret-key';
+class LanceCDNClient {
+    constructor() {
+        this.apiKey = null;
+        this.baseUrl = null;
+        this.isInitialized = false;
+    }
 
-app.use(cors());
-app.use(express.json());
+    connect(apiKey, deployedUrl) {
+        if (!apiKey || !deployedUrl) {
+            throw new Error('API Key and deployed URL are required for connection.');
+        }
+        this.apiKey = apiKey;
+        this.baseUrl = deployedUrl.replace(/\/$/, ''); 
+        this.isInitialized = true;
+        console.log(`LanceCDN connected to: ${this.baseUrl}`);
+    }
 
-const db = new sqlite3.Database('./lance-cdn.db');
+    _checkInitialized() {
+        if (!this.isInitialized) {
+            throw new Error('LanceCDN Client is not initialized. Call lancecdn.connect(apiKey, url) first.');
+        }
+    }
 
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password_hash TEXT,
-    api_key TEXT UNIQUE
-  )`);
-});
+    async _apiCall(endpoint, method = 'GET', data = null) {
+        this._checkInitialized();
+        const url = `${this.baseUrl}${endpoint}`;
 
-const storage = multer.memoryStorage();
+        const options = {
+            method: method,
+            headers: {
+                'x-api-key': this.apiKey,
+            },
+        };
 
-const upload = multer({
-  storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-  fileFilter: (req, file, cb) => {
-    cb(null, true);
-  }
-});
+        if (data instanceof FormData) {
+            options.body = data;
+        } else if (data) {
+            options.headers['Content-Type'] = 'application/json';
+            options.body = JSON.stringify(data);
+        }
 
-const verifyToken = (req, res, next) => {
-  const token = req.headers['authorization']?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Access denied' });
+        try {
+            const response = await fetch(url, options);
+            const contentType = response.headers.get('content-type');
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: 'Invalid token' });
-    req.user = user;
-    next();
-  });
+            let errorMessage = 'Unknown error';
+
+            if (!response.ok) {
+                const errorBody = (contentType && contentType.includes('application/json')) ? await response.json() : await response.text();
+
+                errorMessage = typeof errorBody === 'object' ? errorBody.error : errorBody;
+
+                throw new Error(`API Error ${response.status}: ${errorMessage}`);
+            }
+
+            if (contentType && contentType.includes('application/json')) {
+                return await response.json();
+            }
+            return response;
+
+        } catch (error) {
+            console.error(`Request to ${url} failed:`, error.message);
+            throw error;
+        }
+    }
+
+    async _resolveIdentifierToId(identifier) {
+        const isHash = identifier.length > 10 && !/^\d+$/.test(identifier);
+
+        if (!isHash) {
+            return identifier;
+        }
+
+        const files = await this._apiCall('/api/files-api', 'GET');
+        const file = files.find(f => f.hash === identifier);
+
+        if (!file) {
+             throw new Error(`File with hash ${identifier} not found.`);
+        }
+        return file.id;
+    }
+
+    async download(identifier, downloadPath) {
+        this._checkInitialized();
+
+        const fileId = await this._resolveIdentifierToId(identifier);
+
+        const files = await this._apiCall('/api/files-api', 'GET');
+        const file = files.find(f => f.id === fileId);
+
+        if (!file) {
+            throw new Error(`File ID ${fileId} not found.`);
+        }
+        const hashToUse = file.hash;
+
+        const endpoint = `/download/${hashToUse}`;
+        const response = await this._apiCall(endpoint);
+
+        if (response.status === 404) {
+             throw new Error(`File with identifier ${identifier} not found.`);
+        }
+
+        const contentDisposition = response.headers.get('content-disposition');
+        let filename = path.basename(downloadPath);
+
+        if (contentDisposition && contentDisposition.includes('filename=')) {
+            const match = contentDisposition.match(/filename="?([^"]+)"?/i);
+            if (match && match[1]) {
+                filename = match[1];
+            }
+        }
+
+        const finalPath = path.join(path.dirname(downloadPath), filename);
+        await fsp.mkdir(path.dirname(finalPath), { recursive: true }); 
+
+        const writer = fs.createWriteStream(finalPath);
+        response.body.pipe(writer);
+
+        return new Promise((resolve, reject) => {
+            writer.on('finish', () => resolve(finalPath));
+            writer.on('error', reject);
+        });
+    }
+
+    async upload(filePath) {
+        this._checkInitialized();
+
+        const filename = path.basename(filePath);
+
+        try {
+            const fileStream = fs.createReadStream(filePath); 
+
+            const formData = new FormData();
+            formData.append('file', fileStream, { filename: filename });
+
+            const result = await this._apiCall('/api/upload-api', 'POST', formData);
+            return result;
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                 throw new Error(`Upload failed: File not found at path ${filePath}`);
+            }
+            throw error;
+        }
+    }
+
+    async remove(identifier) {
+        this._checkInitialized();
+
+        const fileId = await this._resolveIdentifierToId(identifier);
+
+        const endpoint = `/api/files-api/${fileId}`;
+        return this._apiCall(endpoint, 'DELETE');
+    }
+
+    async rename(identifier, newName) {
+        this._checkInitialized();
+
+        const fileId = await this._resolveIdentifierToId(identifier);
+
+        const endpoint = `/api/files-api/${fileId}`;
+        return this._apiCall(endpoint, 'PUT', { newName });
+    }
+
+    async editContent(identifier, newContent) {
+        this._checkInitialized();
+
+        const fileId = await this._resolveIdentifierToId(identifier);
+
+        const endpoint = `/api/files-api/${fileId}/content`;
+        return this._apiCall(endpoint, 'PUT', { content: newContent });
+    }
+}
+
+const clientInstance = new LanceCDNClient();
+
+const lancecdn = {
+    connect: clientInstance.connect.bind(clientInstance),
+    download: clientInstance.download.bind(clientInstance),
+    upload: clientInstance.upload.bind(clientInstance),
+    delete: clientInstance.remove.bind(clientInstance),
+    rename: clientInstance.rename.bind(clientInstance),
+    editContent: clientInstance.editContent.bind(clientInstance),
 };
 
-const verifyApiKey = (req, res, next) => {
-  const apiKey = req.headers['x-api-key'];
-  if (!apiKey) return res.status(401).json({ error: 'API key required' });
-
-  db.get('SELECT id, username FROM users WHERE api_key = ?', [apiKey], (err, user) => {
-    if (err || !user) return res.status(401).json({ error: 'Invalid API key' });
-    req.user = user;
-    next();
-  });
-};
-
-const apiRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each API key to 100 requests per `windowMs`
-  message: 'Too many upload requests from this API Key, please try again after 15 minutes',
-  keyGenerator: (req, res) => {
-    return req.user && req.user.id ? `upload_user_${req.user.id}` : req.ip; 
-  },
-  statusCode: 429, 
-  standardHeaders: true, 
-  legacyHeaders: false, 
-});
-
-app.post('/api/signup', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
-
-  const hashedPassword = await bcrypt.hash(password, 10);
-  const apiKey = crypto.randomBytes(32).toString('hex');
-
-  db.run('INSERT INTO users (username, password_hash, api_key) VALUES (?, ?, ?)', [username, hashedPassword, apiKey], function(err) {
-    if (err) return res.status(400).json({ error: 'Username already exists' });
-
-    db.run(`CREATE TABLE IF NOT EXISTS files_user_${this.lastID} (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      filename TEXT,
-      hash TEXT UNIQUE,
-      content TEXT,
-      size INTEGER,
-      uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
-
-    const token = jwt.sign({ id: this.lastID, username }, JWT_SECRET);
-    res.json({ message: 'User created', api_key: apiKey, token });
-  });
-});
-
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
-
-  db.get('SELECT * FROM users WHERE username = ?', [username], async (err, user) => {
-    if (err || !user || !(await bcrypt.compare(password, user.password_hash))) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
-    res.json({ token, api_key: user.api_key });
-  });
-});
-
-app.post('/api/upload', verifyToken, upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-
-  const userId = req.user.id;
-  const hash = crypto.randomBytes(16).toString('hex');
-  const content = req.file.buffer.toString('base64');
-
-  db.run(`CREATE TABLE IF NOT EXISTS files_user_${userId} (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    filename TEXT,
-    hash TEXT UNIQUE,
-    content TEXT,
-    size INTEGER,
-    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  db.run(`INSERT INTO files_user_${userId} (filename, hash, content, size) VALUES (?, ?, ?, ?)`,
-    [req.file.originalname, hash, content, req.file.size], function(err) {
-      if (err) return res.status(500).json({ error: 'Upload failed' });
-      res.json({ message: 'File uploaded', hash });
-    });
-});
-
-// Endpoint for API Key upload
-app.post('/api/upload-api', verifyApiKey, apiRateLimiter, upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-
-  const userId = req.user.id;
-  const hash = crypto.randomBytes(16).toString('hex');
-  const content = req.file.buffer.toString('base64');
-
-  db.run(`CREATE TABLE IF NOT EXISTS files_user_${userId} (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    filename TEXT,
-    hash TEXT UNIQUE,
-    content TEXT,
-    size INTEGER,
-    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  db.run(`INSERT INTO files_user_${userId} (filename, hash, content, size) VALUES (?, ?, ?, ?)`,
-    [req.file.originalname, hash, content, req.file.size], function(err) {
-      if (err) return res.status(500).json({ error: 'Upload failed' });
-      res.json({ message: 'File uploaded', hash });
-    });
-});
-
-app.get('/api/files', verifyToken, (req, res) => {
-  const userId = req.user.id;
-  db.all(`SELECT * FROM files_user_${userId}`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Failed to fetch files' });
-    res.json(rows);
-  });
-});
-
-// New Endpoint to get files using API Key
-app.get('/api/files-api', verifyApiKey, (req, res) => {
-  const userId = req.user.id;
-  // Select only the required fields: id, filename, hash
-  db.all(`SELECT id, filename, hash FROM files_user_${userId}`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Failed to fetch files' });
-    res.json(rows);
-  });
-});
-
-app.put('/api/files/:id', verifyToken, (req, res) => {
-  const { id } = req.params;
-  const { newName } = req.body;
-  const userId = req.user.id;
-
-  if (!newName) return res.status(400).json({ error: 'New name required' });
-
-  db.run(`UPDATE files_user_${userId} SET filename = ? WHERE id = ?`, [newName, id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to rename file' });
-    if (this.changes === 0) return res.status(404).json({ error: 'File not found' });
-    res.json({ message: 'File renamed' });
-  });
-});
-
-app.delete('/api/files/:id', verifyToken, (req, res) => {
-  const { id } = req.params;
-  const userId = req.user.id;
-
-  db.run(`DELETE FROM files_user_${userId} WHERE id = ?`, [id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to delete file' });
-    if (this.changes === 0) return res.status(404).json({ error: 'File not found' });
-    res.json({ message: 'File deleted' });
-  });
-});
-
-app.put('/api/files/:id/content', verifyToken, (req, res) => {
-  const { id } = req.params;
-  const { content } = req.body;
-  const userId = req.user.id;
-
-  if (content === undefined) return res.status(400).json({ error: 'Content required' });
-
-  const contentBase64 = Buffer.from(content).toString('base64');
-
-  db.run(`UPDATE files_user_${userId} SET content = ? WHERE id = ?`, [contentBase64, id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to update file content' });
-    if (this.changes === 0) return res.status(404).json({ error: 'File not found' });
-    res.json({ message: 'File content updated' });
-  });
-});
-
-app.get('/download/:hash', (req, res) => {
-  const hash = req.params.hash;
-  // Find file by hash across all user tables
-  db.all("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'files_user_%'", [], (err, tables) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-
-    let checked = 0;
-    const total = tables.length;
-    let found = false;
-
-    if (total === 0) return res.status(404).json({ error: 'File not found' });
-
-    tables.forEach(table => {
-      db.get(`SELECT * FROM ${table.name} WHERE hash = ?`, [hash], (err, file) => {
-        checked++;
-        if (err) {
-          console.error(err);
-        } else if (file && !found) {
-          found = true;
-          const buffer = Buffer.from(file.content, 'base64');
-          res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
-          res.setHeader('Content-Type', 'application/octet-stream');
-          res.send(buffer);
-        }
-        if (checked === total && !found) {
-          res.status(404).json({ error: 'File not found' });
-        }
-      });
-    });
-  });
-});
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+export default lancecdn;
