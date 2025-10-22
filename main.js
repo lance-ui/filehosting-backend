@@ -1,252 +1,382 @@
-import express from 'express';
-import sqlite3 from 'sqlite3';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-import multer from 'multer';
-import cors from 'cors';
-import crypto from 'crypto';
-import path from 'path';
-import fs from 'fs';
-import rateLimit from 'express-rate-limit';
+import express from "express";
+import postgres from "postgres";
+import multer from "multer";
+import cors from "cors";
+import crypto from "crypto";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import "dotenv/config";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = 'your-secret-key';
+
+const DATABASE_URL = process.env.DATABASE_URL;
+const JWT_SECRET = process.env.JWT_SECRET || "your-default-jwt-secret";
+
+if (!DATABASE_URL) {
+    console.error("Error: DATABASE_URL must be set in .env");
+    process.exit(1);
+}
+
+const sql = postgres(DATABASE_URL);
 
 app.use(cors());
 app.use(express.json());
 
-const db = new sqlite3.Database('./lance-cdn.db');
-
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password_hash TEXT,
-    api_key TEXT UNIQUE
-  )`);
-});
-
 const storage = multer.memoryStorage();
-
 const upload = multer({
-  storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-  fileFilter: (req, file, cb) => {
-    cb(null, true);
-  }
+    storage: storage,
+    limits: { fileSize: 10 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        cb(null, true);
+    },
 });
 
 const verifyToken = (req, res, next) => {
-  const token = req.headers['authorization']?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Access denied' });
+    const token = req.headers["authorization"]?.split(" ")[1];
+    if (!token)
+        return res
+            .status(401)
+            .json({ error: "Access denied, no token provided" });
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: 'Invalid token' });
-    req.user = user;
-    next();
-  });
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: "Invalid token" });
+        req.user = user;
+        next();
+    });
 };
 
-const verifyApiKey = (req, res, next) => {
-  const apiKey = req.headers['x-api-key'];
-  if (!apiKey) return res.status(401).json({ error: 'API key required' });
+const verifyApiKey = async (req, res, next) => {
+    const apiKey = req.headers["x-api-key"];
+    if (!apiKey) return res.status(401).json({ error: "API key required" });
 
-  db.get('SELECT id, username FROM users WHERE api_key = ?', [apiKey], (err, user) => {
-    if (err || !user) return res.status(401).json({ error: 'Invalid API key' });
-    req.user = user;
-    next();
-  });
+    try {
+        const [user] = await sql`
+            SELECT id, username 
+            FROM users 
+            WHERE api_key = ${apiKey}
+        `;
+
+        if (!user) {
+            return res.status(401).json({ error: "Invalid API key" });
+        }
+
+        req.user = user;
+        next();
+    } catch (e) {
+        console.error("Database error fetching user (verifyApiKey):", e);
+        return res
+            .status(500)
+            .json({ error: "Internal server error during API key lookup." });
+    }
 };
 
 const apiRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each API key to 100 requests per `windowMs`
-  message: 'Too many upload requests from this API Key, please try again after 15 minutes',
-  keyGenerator: (req, res) => {
-    return req.user && req.user.id ? `upload_user_${req.user.id}` : req.ip; 
-  },
-  statusCode: 429, 
-  standardHeaders: true, 
-  legacyHeaders: false, 
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    message:
+        "Too many upload requests from this IP/User, please try again after 15 minutes",
+    keyGenerator: (req, res) => {
+        if (req.user && req.user.id) {
+            return `user_${req.user.id}`;
+        }
+        return ipKeyGenerator(req, res);
+    },
+    statusCode: 429,
+    standardHeaders: true,
+    legacyHeaders: false,
 });
 
-app.post('/api/signup', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
 
-  const hashedPassword = await bcrypt.hash(password, 10);
-  const apiKey = crypto.randomBytes(32).toString('hex');
+app.post("/api/signup", async (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password)
+        return res
+            .status(400)
+            .json({ error: "Username and password required" });
 
-  db.run('INSERT INTO users (username, password_hash, api_key) VALUES (?, ?, ?)', [username, hashedPassword, apiKey], function(err) {
-    if (err) return res.status(400).json({ error: 'Username already exists' });
+    try {
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const apiKey = crypto.randomBytes(32).toString("hex");
 
-    db.run(`CREATE TABLE IF NOT EXISTS files_user_${this.lastID} (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      filename TEXT,
-      hash TEXT UNIQUE,
-      content TEXT,
-      size INTEGER,
-      uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+        const [user] = await sql`
+            INSERT INTO users (username, password_hash, api_key) 
+            VALUES (${username}, ${hashedPassword}, ${apiKey})
+            RETURNING id
+        `;
 
-    const token = jwt.sign({ id: this.lastID, username }, JWT_SECRET);
-    res.json({ message: 'User created', api_key: apiKey, token });
-  });
+        const token = jwt.sign({ id: user.id, username }, JWT_SECRET, {
+            expiresIn: "7d",
+        });
+
+        res.json({
+            message: "User created and logged in",
+            token,
+            api_key: apiKey,
+            user: { id: user.id, username },
+        });
+    } catch (e) {
+        console.error("Signup error:", e);
+        if (e.code === "23505") {
+            return res.status(400).json({ error: "Username already taken" });
+        }
+        return res
+            .status(500)
+            .json({ error: "Failed to create user due to a server error." });
+    }
 });
 
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+app.post("/api/login", async (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password)
+        return res
+            .status(400)
+            .json({ error: "Username and password required" });
 
-  db.get('SELECT * FROM users WHERE username = ?', [username], async (err, user) => {
-    if (err || !user || !(await bcrypt.compare(password, user.password_hash))) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
+    try {
+        const [user] = await sql`
+            SELECT id, username, password_hash, api_key 
+            FROM users 
+            WHERE username = ${username}
+        `;
 
-    const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
-    res.json({ token, api_key: user.api_key });
-  });
+        if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+            return res.status(401).json({ error: "Invalid credentials" });
+        }
+
+        const token = jwt.sign(
+            { id: user.id, username: user.username },
+            JWT_SECRET,
+            { expiresIn: "7d" },
+        );
+
+        res.json({
+            token,
+            api_key: user.api_key,
+            user: { id: user.id, username: user.username },
+        });
+    } catch (e) {
+        console.error("Login error:", e);
+        return res
+            .status(500)
+            .json({ error: "Internal server error during login." });
+    }
 });
 
-app.post('/api/upload', verifyToken, upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-  const userId = req.user.id;
-  const hash = crypto.randomBytes(16).toString('hex');
-  const content = req.file.buffer.toString('base64');
+const handleFileUpload = async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-  db.run(`CREATE TABLE IF NOT EXISTS files_user_${userId} (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    filename TEXT,
-    hash TEXT UNIQUE,
-    content TEXT,
-    size INTEGER,
-    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
+    const userId = req.user.id;
+    const hash = crypto.randomBytes(16).toString("hex");
+    const file = req.file;
 
-  db.run(`INSERT INTO files_user_${userId} (filename, hash, content, size) VALUES (?, ?, ?, ?)`,
-    [req.file.originalname, hash, content, req.file.size], function(err) {
-      if (err) return res.status(500).json({ error: 'Upload failed' });
-      res.json({ message: 'File uploaded', hash });
-    });
+    const storagePath = `${userId}/${hash}/${file.originalname}`;
+
+    try {
+        await sql`
+            INSERT INTO files (user_id, filename, hash, size, storage_path) 
+            VALUES (${userId}, ${file.originalname}, ${hash}, ${file.size}, ${storagePath})
+        `;
+
+        res.json({ message: "File uploaded", hash });
+    } catch (e) {
+        console.error("Database insert error:", e);
+        return res
+            .status(500)
+            .json({ error: "Upload failed, could not save file metadata" });
+    }
+};
+
+app.post(
+    "/api/upload",
+    verifyToken,
+    apiRateLimiter,
+    upload.single("file"),
+    handleFileUpload,
+);
+
+app.post(
+    "/api/upload-api",
+    verifyApiKey,
+    apiRateLimiter,
+    upload.single("file"),
+    handleFileUpload,
+);
+
+app.get("/api/files", verifyToken, async (req, res) => {
+    const userId = req.user.id;
+    try {
+        const data = await sql`
+            SELECT id, filename, hash, size, uploaded_at 
+            FROM files 
+            WHERE user_id = ${userId}
+        `;
+        res.json(data);
+    } catch (e) {
+        console.error("Failed to fetch files:", e);
+        return res.status(500).json({ error: "Failed to fetch files" });
+    }
 });
 
-// Endpoint for API Key upload
-app.post('/api/upload-api', verifyApiKey, apiRateLimiter, upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-
-  const userId = req.user.id;
-  const hash = crypto.randomBytes(16).toString('hex');
-  const content = req.file.buffer.toString('base64');
-
-  db.run(`CREATE TABLE IF NOT EXISTS files_user_${userId} (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    filename TEXT,
-    hash TEXT UNIQUE,
-    content TEXT,
-    size INTEGER,
-    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  db.run(`INSERT INTO files_user_${userId} (filename, hash, content, size) VALUES (?, ?, ?, ?)`,
-    [req.file.originalname, hash, content, req.file.size], function(err) {
-      if (err) return res.status(500).json({ error: 'Upload failed' });
-      res.json({ message: 'File uploaded', hash });
-    });
+app.get("/api/files-api", verifyApiKey, async (req, res) => {
+    const userId = req.user.id;
+    try {
+        const data = await sql`
+            SELECT id, filename, hash, size, uploaded_at 
+            FROM files 
+            WHERE user_id = ${userId}
+        `;
+        res.json(data);
+    } catch (e) {
+        console.error("Failed to fetch files:", e);
+        return res.status(500).json({ error: "Failed to fetch files" });
+    }
 });
 
-app.get('/api/files', verifyToken, (req, res) => {
-  const userId = req.user.id;
-  db.all(`SELECT * FROM files_user_${userId}`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Failed to fetch files' });
-    res.json(rows);
-  });
+app.put("/api/files/:id", verifyToken, async (req, res) => {
+    const { id } = req.params;
+    const { newName } = req.body;
+    const userId = req.user.id;
+
+    if (!newName) return res.status(400).json({ error: "New name required" });
+
+    try {
+        const [file] = await sql`
+            SELECT storage_path, filename 
+            FROM files 
+            WHERE id = ${id} AND user_id = ${userId}
+        `;
+
+        if (!file) {
+            return res.status(404).json({ error: "File not found" });
+        }
+
+        if (file.filename === newName) {
+            return res.json({ message: "File already has that name" });
+        }
+
+        const oldPath = file.storage_path;
+        const pathParts = oldPath.split("/");
+        pathParts[pathParts.length - 1] = newName;
+        const newPath = pathParts.join("/");
+
+        const updated = await sql`
+            UPDATE files 
+            SET filename = ${newName}, storage_path = ${newPath} 
+            WHERE id = ${id} AND user_id = ${userId}
+        `;
+
+        if (updated.length === 0) {
+            console.error("DB update failed after move (0 rows affected).");
+            return res
+                .status(500)
+                .json({ error: "Failed to update file metadata" });
+        }
+
+        res.json({ message: "File renamed" });
+    } catch (e) {
+        console.error("Rename error:", e);
+        return res
+            .status(500)
+            .json({ error: "Internal server error during rename." });
+    }
 });
 
-// New Endpoint to get files using API Key
-app.get('/api/files-api', verifyApiKey, (req, res) => {
-  const userId = req.user.id;
-  // Select only the required fields: id, filename, hash
-  db.all(`SELECT id, filename, hash FROM files_user_${userId}`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Failed to fetch files' });
-    res.json(rows);
-  });
+app.delete("/api/files/:id", verifyToken, async (req, res) => {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    try {
+        const [deleted] = await sql`
+            DELETE FROM files 
+            WHERE id = ${id} AND user_id = ${userId}
+            RETURNING storage_path
+        `;
+
+        if (!deleted) {
+            return res
+                .status(404)
+                .json({ error: "File not found or failed to delete" });
+        }
+
+        res.json({ message: "File deleted" });
+    } catch (e) {
+        console.error("Delete error:", e);
+        return res
+            .status(500)
+            .json({ error: "Internal server error during deletion." });
+    }
 });
 
-app.put('/api/files/:id', verifyToken, (req, res) => {
-  const { id } = req.params;
-  const { newName } = req.body;
-  const userId = req.user.id;
+app.put("/api/files/:id/content", verifyToken, async (req, res) => {
+    const { id } = req.params;
+    const { content } = req.body;
+    const userId = req.user.id;
 
-  if (!newName) return res.status(400).json({ error: 'New name required' });
+    if (content === undefined) {
+        return res.status(400).json({ error: "Content required" });
+    }
 
-  db.run(`UPDATE files_user_${userId} SET filename = ? WHERE id = ?`, [newName, id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to rename file' });
-    if (this.changes === 0) return res.status(404).json({ error: 'File not found' });
-    res.json({ message: 'File renamed' });
-  });
+    const buffer = Buffer.from(content, "base64");
+
+    try {
+        const [file] = await sql`
+            SELECT storage_path 
+            FROM files 
+            WHERE id = ${id} AND user_id = ${userId}
+        `;
+
+        if (!file) {
+            return res.status(404).json({ error: "File not found" });
+        }
+
+        await sql`
+            UPDATE files 
+            SET size = ${buffer.length} 
+            WHERE id = ${id}
+        `;
+
+        res.json({ message: "File content updated" });
+    } catch (e) {
+        console.error("Update content error:", e);
+        return res
+            .status(500)
+            .json({ error: "Internal server error during content update." });
+    }
 });
 
-app.delete('/api/files/:id', verifyToken, (req, res) => {
-  const { id } = req.params;
-  const userId = req.user.id;
+app.get("/download/:hash", async (req, res) => {
+    const { hash } = req.params;
 
-  db.run(`DELETE FROM files_user_${userId} WHERE id = ?`, [id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to delete file' });
-    if (this.changes === 0) return res.status(404).json({ error: 'File not found' });
-    res.json({ message: 'File deleted' });
-  });
-});
+    try {
+        const [file] = await sql`
+            SELECT storage_path, filename 
+            FROM files 
+            WHERE hash = ${hash}
+        `;
 
-app.put('/api/files/:id/content', verifyToken, (req, res) => {
-  const { id } = req.params;
-  const { content } = req.body;
-  const userId = req.user.id;
+        if (!file) {
+            return res.status(404).json({ error: "File not found" });
+        }
 
-  if (content === undefined) return res.status(400).json({ error: 'Content required' });
+        const fileContentBuffer = Buffer.from("");
 
-  const contentBase64 = Buffer.from(content).toString('base64');
-
-  db.run(`UPDATE files_user_${userId} SET content = ? WHERE id = ?`, [contentBase64, id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to update file content' });
-    if (this.changes === 0) return res.status(404).json({ error: 'File not found' });
-    res.json({ message: 'File content updated' });
-  });
-});
-
-app.get('/download/:hash', (req, res) => {
-  const hash = req.params.hash;
-  // Find file by hash across all user tables
-  db.all("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'files_user_%'", [], (err, tables) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-
-    let checked = 0;
-    const total = tables.length;
-    let found = false;
-
-    if (total === 0) return res.status(404).json({ error: 'File not found' });
-
-    tables.forEach(table => {
-      db.get(`SELECT * FROM ${table.name} WHERE hash = ?`, [hash], (err, file) => {
-        checked++;
-        if (err) {
-          console.error(err);
-        } else if (file && !found) {
-          found = true;
-          const buffer = Buffer.from(file.content, 'base64');
-          res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
-          res.setHeader('Content-Type', 'application/octet-stream');
-          res.send(buffer);
-        }
-        if (checked === total && !found) {
-          res.status(404).json({ error: 'File not found' });
-        }
-      });
-    });
-  });
+        res.setHeader(
+            "Content-Disposition",
+            `attachment; filename="${file.filename}"`,
+        );
+        res.setHeader("Content-Type", "application/octet-stream");
+        res.send(fileContentBuffer);
+    } catch (e) {
+        console.error("Download error:", e);
+        return res
+            .status(500)
+            .json({ error: "Internal server error during download." });
+    }
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
