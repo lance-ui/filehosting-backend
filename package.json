@@ -6,8 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node main.js"
-  },"
-  "author": "",
+  },
+  "author": "lance",
   "license": "ISC",
   "dependencies": {
     "bcryptjs": "^3.0.2",
