@@ -44,6 +44,7 @@ async function setupDatabase() {
                 size BIGINT NOT NULL,
                 storage_path TEXT NOT NULL,
                 uploaded_at TIMESTAMP DEFAULT NOW(),
+                content TEXT NOT NULL,
                 
                 CONSTRAINT fk_user
                     FOREIGN KEY(user_id) 
@@ -55,7 +56,7 @@ async function setupDatabase() {
         console.log("Database tables are ready.");
     } catch (error) {
         console.error("Error setting up database:", error);
-        process.exit(1); 
+        process.exit(1);
     }
 }
 
@@ -210,12 +211,15 @@ const handleFileUpload = async (req, res) => {
     const hash = crypto.randomBytes(16).toString("hex");
     const file = req.file;
 
-    const storagePath = `${userId}/${hash}/${file.originalname}`;
+    const storagePath = `db/${userId}/${hash}/${file.originalname}`;
+    
+    const base64Content = file.buffer.toString("base64");
+    const fileSize = file.size;
 
     try {
         await sql`
-            INSERT INTO files (user_id, filename, hash, size, storage_path) 
-            VALUES (${userId}, ${file.originalname}, ${hash}, ${file.size}, ${storagePath})
+            INSERT INTO files (user_id, filename, hash, size, storage_path, content) 
+            VALUES (${userId}, ${file.originalname}, ${hash}, ${fileSize}, ${storagePath}, ${base64Content})
         `;
 
         res.json({ message: "File uploaded", hash });
@@ -223,7 +227,7 @@ const handleFileUpload = async (req, res) => {
         console.error("Database insert error:", e);
         return res
             .status(500)
-            .json({ error: "Upload failed, could not save file metadata" });
+            .json({ error: "Upload failed, could not save file metadata or content" });
     }
 };
 
@@ -348,6 +352,34 @@ app.delete("/api/files/:id", verifyToken, async (req, res) => {
     }
 });
 
+app.get("/api/files/:id/content", verifyToken, async (req, res) => {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    try {
+        const [file] = await sql`
+            SELECT content, filename 
+            FROM files 
+            WHERE id = ${id} AND user_id = ${userId}
+        `;
+
+        if (!file) {
+            return res.status(404).json({ error: "File not found" });
+        }
+        
+        const base64Content = file.content || ""; 
+        
+        res.json({ content: base64Content, filename: file.filename });
+
+    } catch (e) {
+        console.error("Get content error:", e);
+        return res
+            .status(500)
+            .json({ error: "Internal server error during content retrieval." });
+    }
+});
+
+
 app.put("/api/files/:id/content", verifyToken, async (req, res) => {
     const { id } = req.params;
     const { content } = req.body;
@@ -357,22 +389,24 @@ app.put("/api/files/:id/content", verifyToken, async (req, res) => {
         return res.status(400).json({ error: "Content required" });
     }
 
-    const buffer = Buffer.from(content, "base64");
+    const newBase64Content = content;
+    
+    const buffer = Buffer.from(newBase64Content, "base64");
 
     try {
         const [file] = await sql`
-            SELECT storage_path 
+            SELECT id 
             FROM files 
             WHERE id = ${id} AND user_id = ${userId}
         `;
 
         if (!file) {
-            return res.status(44).json({ error: "File not found" });
+            return res.status(404).json({ error: "File not found" });
         }
 
         await sql`
             UPDATE files 
-            SET size = ${buffer.length} 
+            SET size = ${buffer.length}, content = ${newBase64Content} 
             WHERE id = ${id}
         `;
 
@@ -390,7 +424,7 @@ app.get("/download/:hash", async (req, res) => {
 
     try {
         const [file] = await sql`
-            SELECT storage_path, filename 
+            SELECT content, filename 
             FROM files 
             WHERE hash = ${hash}
         `;
@@ -398,15 +432,21 @@ app.get("/download/:hash", async (req, res) => {
         if (!file) {
             return res.status(404).json({ error: "File not found" });
         }
-
-        const fileContentBuffer = Buffer.from("");
+        
+        const base64Content = file.content; 
+        if (!base64Content) {
+             return res.status(500).json({ error: "File content missing from database" });
+        }
+        
+        const fileContentBuffer = Buffer.from(base64Content, "base64"); 
 
         res.setHeader(
             "Content-Disposition",
             `attachment; filename="${file.filename}"`,
         );
         res.setHeader("Content-Type", "application/octet-stream");
-        res.send(fileContentBuffer);
+        
+        res.send(fileContentBuffer); 
     } catch (e) {
         console.error("Download error:", e);
         return res
