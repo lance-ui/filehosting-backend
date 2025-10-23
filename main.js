@@ -21,6 +21,44 @@ if (!DATABASE_URL) {
 
 const sql = postgres(DATABASE_URL);
 
+async function setupDatabase() {
+    try {
+        console.log("Checking and creating database tables...");
+
+        await sql`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                api_key TEXT UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        `;
+
+        await sql`
+            CREATE TABLE IF NOT EXISTS files (
+                id SERIAL PRIMARY KEY,
+                user_id INT NOT NULL,
+                filename TEXT NOT NULL,
+                hash TEXT UNIQUE NOT NULL,
+                size BIGINT NOT NULL,
+                storage_path TEXT NOT NULL,
+                uploaded_at TIMESTAMP DEFAULT NOW(),
+                
+                CONSTRAINT fk_user
+                    FOREIGN KEY(user_id) 
+                    REFERENCES users(id) 
+                    ON DELETE CASCADE
+            )
+        `;
+
+        console.log("Database tables are ready.");
+    } catch (error) {
+        console.error("Error setting up database:", error);
+        process.exit(1); 
+    }
+}
+
 app.use(cors());
 app.use(express.json());
 
@@ -329,7 +367,7 @@ app.put("/api/files/:id/content", verifyToken, async (req, res) => {
         `;
 
         if (!file) {
-            return res.status(404).json({ error: "File not found" });
+            return res.status(44).json({ error: "File not found" });
         }
 
         await sql`
@@ -377,6 +415,12 @@ app.get("/download/:hash", async (req, res) => {
     }
 });
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+async function startServer() {
+    await setupDatabase(); 
+    
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+    });
+}
+
+startServer();
