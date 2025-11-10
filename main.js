@@ -126,7 +126,12 @@ const apiRateLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
 });
-
+app.get('/', (req,res) => {
+    return res.status(200).json({ 
+        status: "online", 
+        message: "you can use this route to uptime your server using online tools like betterstack or uptimerobot etc" 
+    })
+})
 
 app.post("/api/signup", async (req, res) => {
     const { username, password } = req.body;
