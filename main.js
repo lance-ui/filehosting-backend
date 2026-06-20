@@ -3,7 +3,7 @@ import postgres from "postgres";
 import multer from "multer";
 import cors from "cors";
 import crypto from "crypto";
-import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import rateLimit from "express-rate-limit";
 import "dotenv/config";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 const DATABASE_URL = process.env.DATABASE_URL;
-const JWT_SECRET = process.env.JWT_SECRET || "your-default-jwt-secret";
+const JWT_SECRET = process.env.JWT_SECRET || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ6KUiRUPZjzPcLD_GxR4EB5SF2V34LKCLdMpYkkUIud0";
 
 if (!DATABASE_URL) {
     console.error("Error: DATABASE_URL must be set in .env");
@@ -87,7 +87,11 @@ const verifyToken = (req, res, next) => {
 };
 
 const verifyApiKey = async (req, res, next) => {
-    const apiKey = req.headers["x-api-key"];
+    let apiKey = req.headers["x-api-key"];
+    if (!apiKey && req.headers["authorization"]?.startsWith("Bearer ")) {
+        apiKey = req.headers["authorization"].split(" ")[1];
+    }
+
     if (!apiKey) return res.status(401).json({ error: "API key required" });
 
     try {
@@ -120,12 +124,13 @@ const apiRateLimiter = rateLimit({
         if (req.user && req.user.id) {
             return `user_${req.user.id}`;
         }
-        return ipKeyGenerator(req, res);
+        return req.ip;
     },
     statusCode: 429,
     standardHeaders: true,
     legacyHeaders: false,
 });
+
 app.get('/', (req,res) => {
     return res.status(200).json({ 
         status: "online", 
@@ -207,7 +212,6 @@ app.post("/api/login", async (req, res) => {
             .json({ error: "Internal server error during login." });
     }
 });
-
 
 const handleFileUpload = async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
@@ -383,7 +387,6 @@ app.get("/api/files/:id/content", verifyToken, async (req, res) => {
             .json({ error: "Internal server error during content retrieval." });
     }
 });
-
 
 app.put("/api/files/:id/content", verifyToken, async (req, res) => {
     const { id } = req.params;
